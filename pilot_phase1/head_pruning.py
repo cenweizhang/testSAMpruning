@@ -16,7 +16,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-import monai
+
+
+def dice_loss(pred, target):
+    """Dice loss with sigmoid, squared_pred, mean reduction. Replaces monai.losses.DiceLoss."""
+    pred = torch.sigmoid(pred)
+    pred = pred.reshape(pred.shape[0], -1)
+    target = target.reshape(target.shape[0], -1)
+    intersection = (pred * target).sum(dim=1)
+    loss = 1.0 - (2.0 * intersection + 1e-5) / (pred.pow(2).sum(dim=1) + target.pow(2).sum(dim=1) + 1e-5)
+    return loss.mean()
 
 
 # ==============================================================================
@@ -51,7 +60,6 @@ def compute_head_gradient_projections(model, dataloader, device, num_blocks=12, 
     model.eval()
     
     # Loss functions (same as MedSAM training)
-    seg_loss_fn = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
     ce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
     
     n_samples = len(dataloader.dataset)
@@ -107,7 +115,7 @@ def compute_head_gradient_projections(model, dataloader, device, num_blocks=12, 
             )  # (B, 1, 256, 256)
             
             # Compute loss
-            loss = seg_loss_fn(low_res_masks, masks.float()) + \
+            loss = dice_loss(low_res_masks, masks.float()) + \
                    ce_loss_fn(low_res_masks, masks.float())
             
             # Per-sample gradient: use backward on total loss then extract
