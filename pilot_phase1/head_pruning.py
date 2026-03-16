@@ -205,7 +205,6 @@ def compute_head_gradient_projections_fast(model, dataloader, device,
     """
     model.eval()
     
-    seg_loss_fn = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="none")
     ce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
     
     n_samples = len(dataloader.dataset)
