@@ -14,7 +14,8 @@ python -m pilot_phase1.run_phase1 \
     --checkpoint work_dir/MedSAM/medsam_vit_b.pth \
     --device cuda:0 \
     --n_calibration 128 \
-    --output_dir results/phase1
+    --output_dir results/phase1 \
+    --lambda1 0.01
 
 ## problems
 [Step 4] Computing head importance scores...
