@@ -4,11 +4,22 @@ Head-level structured pruning for MedSAM Image Encoder.
 
 Implements 4 head importance scoring methods:
   1. Random scoring
-  2. Magnitude scoring (L2 norm of head's qkv weights)
+  2. Magnitude scoring (L2 norm of head's qkv + proj weights)
   3. Pointwise Regression scoring (per-sample gradient alignment)
   4. EWR scoring (Entropy-regularized Wasserstein Regression)
 
-And head masking mechanism for zero-shot structural pruning.
+Changes vs original:
+  P0.1: apply_head_mask_to_model — hook moved to BEFORE proj (forward_pre_hook
+        on attn.proj), so zeroing is semantically correct head removal.
+  P0.2: compute_head_gradient_projections_fast — single forward+backward pass
+        per sample (all blocks together), eliminating the 12x redundant passes.
+  P0.3: Same single-pass produces consistent global gradients; projection sum
+        is now computed within one computation graph.
+  P1.1: compute_head_gradient_projections_fast accepts freq_weights and applies
+        sqrt(ω_freq) weighting to each sample's projection (spec §3).
+  P1.2: score_heads_ewr adds L2 regularization term λ1‖θ_j‖² (spec §3 EWR obj).
+        compute_head_l2_norms() computes ‖θ̄_j‖ for each head.
+  Removed: compute_head_gradient_projections() (batch-averaged, wrong per-sample logic).
 """
 
 import torch
@@ -19,289 +30,188 @@ from tqdm import tqdm
 
 
 def dice_loss(pred, target):
-    """Dice loss with sigmoid, squared_pred, mean reduction. Replaces monai.losses.DiceLoss."""
+    """Soft Dice loss (sigmoid activation, squared_pred=False, mean reduction)."""
     pred = torch.sigmoid(pred)
-    pred = pred.reshape(pred.shape[0], -1)
+    pred   = pred.reshape(pred.shape[0], -1)
     target = target.reshape(target.shape[0], -1)
     intersection = (pred * target).sum(dim=1)
-    loss = 1.0 - (2.0 * intersection + 1e-5) / (pred.pow(2).sum(dim=1) + target.pow(2).sum(dim=1) + 1e-5)
+    loss = 1.0 - (2.0 * intersection + 1e-5) / (
+        pred.pow(2).sum(dim=1) + target.pow(2).sum(dim=1) + 1e-5
+    )
     return loss.mean()
 
 
 # ==============================================================================
-# 1. Gradient Computation (per-head, per-sample)
+# P0.2 + P0.3 + P1.1 — Gradient Computation (single-pass, all blocks, weighted)
 # ==============================================================================
 
-def compute_head_gradient_projections(model, dataloader, device, num_blocks=12, num_heads=12):
+def compute_head_gradient_projections_fast(
+    model, dataloader, device,
+    num_blocks=12, num_heads=12,
+    freq_weights=None,
+):
     """
-    Compute per-sample gradient projections for each head.
-    
-    For each calibration sample i and each head j, compute:
-        projection[i, j] = g_i^T * theta_j
-    where g_i is the gradient of the loss w.r.t. head j's parameters,
-    and theta_j is the head's parameter vector.
-    
-    This is computed per-block to control memory usage.
-    
+    Compute per-sample gradient projections for each attention head.
+
+    P0.2 fix: ONE forward+backward pass per sample (all attention blocks
+    enabled simultaneously), eliminating 12 redundant forward passes.
+
+    P0.3 fix: Because all blocks share the same computation graph, the
+    per-head projections g_j^T·θ_j are computed from a single consistent
+    gradient, making their sum a valid approximation of the global attention-
+    subspace projection.
+
+    P1.1: Applies sqrt(ω_i^freq) weighting:
+        per_sample_projections[i, j] = sqrt(ω_i) · g_{i,j}^T · θ_j
+    which constructs the frequency-weighted empirical distribution for EWR.
+
     Args:
-        model: MedSAM model (Sam) on device, eval mode
-        dataloader: calibration data loader
-        device: torch device
-        num_blocks: number of ViT blocks (12 for ViT-B)
-        num_heads: number of attention heads per block (12 for ViT-B)
-    
+        model        : MedSAM model (Sam) on device, eval mode
+        dataloader   : calibration DataLoader (batch_size arbitrary)
+        device       : torch device
+        num_blocks   : number of ViT blocks (12 for ViT-B)
+        num_heads    : attention heads per block (12 for ViT-B)
+        freq_weights : np.ndarray of shape (n_samples,) with ω_i^freq values.
+                       If None, all weights are 1 (no frequency prior).
+
     Returns:
-        projections: np.ndarray of shape (n_samples, num_blocks * num_heads)
-            Each entry is g_i^T * theta_j (scalar projection)
-        teacher_projections: np.ndarray of shape (n_samples, num_blocks * num_heads)
-            Each entry is g_i^T * theta_bar_j (teacher projection, same values 
-            since we compute grad at teacher params)
+        head_importance        : np.ndarray (total_heads,) — mean |projection|
+        per_sample_projections : np.ndarray (n_samples, total_heads) — weighted
     """
     model.eval()
-    
-    # Loss functions (same as MedSAM training)
-    ce_loss_fn = nn.BCEWithLogitsLoss(reduction="mean")
-    
-    n_samples = len(dataloader.dataset)
+
+    n_samples  = len(dataloader.dataset)
     total_heads = num_blocks * num_heads
-    
-    # We'll accumulate gradient norms per head per sample
-    # For projection: g_i^T * theta = sum(g_i * theta) element-wise
-    projections = np.zeros((n_samples, total_heads), dtype=np.float32)
-    
+
+    if freq_weights is None:
+        freq_weights = np.ones(n_samples, dtype=np.float32)
+
+    assert len(freq_weights) == n_samples, (
+        f"freq_weights length {len(freq_weights)} != n_samples {n_samples}"
+    )
+
+    per_sample_projections = np.zeros((n_samples, total_heads), dtype=np.float32)
+
     sample_idx = 0
-    
-    for batch in tqdm(dataloader, desc="Computing gradients"):
-        images = batch["image"].to(device)        # (B, 3, 1024, 1024)
-        masks = batch["mask_256"].to(device)       # (B, 1, 256, 256)
-        bboxes = batch["bbox"].numpy()             # (B, 4)
+
+    for batch in tqdm(dataloader, desc="Computing head gradients (single-pass)"):
+        images = batch["image"].to(device)    # (B, 3, 1024, 1024)
+        masks  = batch["mask_256"].to(device) # (B, 1, 256, 256)
+        bboxes = batch["bbox"].numpy()        # (B, 4)
         B = images.shape[0]
-        
-        # Process each block independently to save memory
-        for block_idx in range(num_blocks):
-            block = model.image_encoder.blocks[block_idx]
-            attn_module = block.attn
-            
-            # Freeze everything
+
+        for b_idx in range(B):
+            if sample_idx >= n_samples:
+                break
+
+            img = images[b_idx:b_idx + 1]
+            msk = masks[b_idx:b_idx + 1]
+            box = bboxes[b_idx:b_idx + 1]
+
+            # -------------------------------------------------------------- #
+            # P0.2: Freeze all params, then unfreeze ALL attention blocks at once
+            # -------------------------------------------------------------- #
             for p in model.parameters():
                 p.requires_grad = False
-            
-            # Unfreeze only this block's attention qkv and proj
-            for p in attn_module.parameters():
-                p.requires_grad = True
-            
-            # Forward pass
+            for blk_idx in range(num_blocks):
+                for p in model.image_encoder.blocks[blk_idx].attn.parameters():
+                    p.requires_grad = True
+
             model.zero_grad()
-            
-            # Get image embeddings
-            image_embedding = model.image_encoder(images)  # (B, 256, 64, 64)
-            
-            # Get prompt embeddings (box prompt, frozen)
+
+            # -------------------------------------------------------------- #
+            # Single forward pass (computation graph retained for all blocks)
+            # -------------------------------------------------------------- #
+            image_embedding = model.image_encoder(img)   # (1, 256, 64, 64)
+
             with torch.no_grad():
-                box_torch = torch.as_tensor(bboxes, dtype=torch.float32, device=device)
-                if len(box_torch.shape) == 2:
-                    box_torch = box_torch[:, None, :]
+                box_t = torch.as_tensor(box, dtype=torch.float32, device=device)
+                if len(box_t.shape) == 2:
+                    box_t = box_t[:, None, :]
                 sparse_emb, dense_emb = model.prompt_encoder(
-                    points=None, boxes=box_torch, masks=None
+                    points=None, boxes=box_t, masks=None
                 )
-            
-            # Decode
+
+            # Mask decoder is NOT under no_grad: gradients must flow back
+            # through it to reach image_embedding → image_encoder parameters.
             low_res_masks, _ = model.mask_decoder(
                 image_embeddings=image_embedding,
                 image_pe=model.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_emb,
                 dense_prompt_embeddings=dense_emb,
                 multimask_output=False,
-            )  # (B, 1, 256, 256)
-            
-            # Compute loss
-            loss = dice_loss(low_res_masks, masks.float()) + \
-                   ce_loss_fn(low_res_masks, masks.float())
-            
-            # Per-sample gradient: use backward on total loss then extract
+            )   # (1, 1, 256, 256)
+
+            loss = (
+                F.binary_cross_entropy_with_logits(low_res_masks, msk.float())
+                + dice_loss(low_res_masks, msk.float())
+            )
+
+            # Single backward — computes gradients for all enabled attention blocks
             loss.backward()
-            
-            # Extract per-head projections from qkv weight gradient
-            # qkv weight: (3*dim, dim), qkv bias: (3*dim,)
-            # Each head occupies head_dim=dim//num_heads channels
-            dim = attn_module.qkv.weight.shape[1]
-            head_dim = dim // num_heads
-            
-            # Compute projection per head: g^T * theta (summed element-wise)
+
+            # -------------------------------------------------------------- #
+            # P1.1: Frequency weighting — apply sqrt(ω_i) to this sample's proj
+            # -------------------------------------------------------------- #
+            sqrt_omega = float(np.sqrt(freq_weights[sample_idx]))
+
+            # -------------------------------------------------------------- #
+            # P0.3: Extract per-head projections from ALL blocks in one loop
+            #        (all gradients from the same computation graph)
+            # -------------------------------------------------------------- #
             with torch.no_grad():
-                qkv_grad = attn_module.qkv.weight.grad  # (3*dim, dim)
-                qkv_weight = attn_module.qkv.weight.data
-                proj_grad = attn_module.proj.weight.grad  # (dim, dim)
-                proj_weight = attn_module.proj.weight.data
-                
-                for h in range(num_heads):
-                    head_id = block_idx * num_heads + h
-                    
-                    # qkv: each of q, k, v has head_dim rows per head
-                    # q rows: [h*head_dim : (h+1)*head_dim]
-                    # k rows: [dim + h*head_dim : dim + (h+1)*head_dim]
-                    # v rows: [2*dim + h*head_dim : 2*dim + (h+1)*head_dim]
-                    q_slice = slice(h * head_dim, (h + 1) * head_dim)
-                    k_slice = slice(dim + h * head_dim, dim + (h + 1) * head_dim)
-                    v_slice = slice(2 * dim + h * head_dim, 2 * dim + (h + 1) * head_dim)
-                    
-                    # proj: output columns for this head
-                    # proj weight shape: (dim, dim), input dim per head: [h*head_dim : (h+1)*head_dim]
-                    p_slice = slice(h * head_dim, (h + 1) * head_dim)
-                    
-                    # Gradient * Weight for this head (summed = dot product)
-                    proj_val = 0.0
-                    # QKV contribution
-                    for s in [q_slice, k_slice, v_slice]:
-                        proj_val += (qkv_grad[s, :] * qkv_weight[s, :]).sum().item()
-                    # Proj contribution  
-                    proj_val += (proj_grad[:, p_slice] * proj_weight[:, p_slice]).sum().item()
-                    
-                    # Bias contributions
-                    if attn_module.qkv.bias is not None and attn_module.qkv.bias.grad is not None:
-                        qkv_b_grad = attn_module.qkv.bias.grad
-                        qkv_b_data = attn_module.qkv.bias.data
-                        for s in [q_slice, k_slice, v_slice]:
-                            proj_val += (qkv_b_grad[s] * qkv_b_data[s]).sum().item()
-                    
-                    if attn_module.proj.bias is not None and attn_module.proj.bias.grad is not None:
-                        # proj bias is shared across all heads, distribute equally
-                        pb_grad = attn_module.proj.bias.grad
-                        pb_data = attn_module.proj.bias.data
-                        proj_val += (pb_grad * pb_data).sum().item() / num_heads
-                    
-                    # Store as batch-averaged projection  
-                    # (Note: loss.backward() gives batch-averaged gradients)
-                    for b in range(B):
-                        if sample_idx + b < n_samples:
-                            projections[sample_idx + b, head_id] = proj_val / B
-            
-            # Clean up
-            model.zero_grad()
-            for p in attn_module.parameters():
-                p.requires_grad = False
-        
-        sample_idx += B
-    
-    # Teacher projections are identical since we compute gradients at teacher params
-    teacher_projections = projections.copy()
-    
-    return projections, teacher_projections
+                for blk_idx in range(num_blocks):
+                    attn      = model.image_encoder.blocks[blk_idx].attn
+                    dim       = attn.qkv.weight.shape[1]
+                    head_dim  = dim // num_heads
 
+                    qkv_g = attn.qkv.weight.grad   # (3*dim, dim)
+                    qkv_w = attn.qkv.weight.data
+                    proj_g = attn.proj.weight.grad  # (dim, dim)
+                    proj_w = attn.proj.weight.data
 
-def compute_head_gradient_projections_fast(model, dataloader, device,
-                                           num_blocks=12, num_heads=12):
-    """
-    Faster gradient projection: compute importance score for each head
-    as |g^T * theta| aggregated over calibration samples.
-    
-    Instead of per-sample projections, aggregates gradient information
-    into a single importance score per head. This is used by both
-    Pointwise and EWR methods.
-    
-    Returns:
-        head_importance: np.ndarray of shape (num_blocks * num_heads,)
-        per_sample_projections: np.ndarray of shape (n_samples, num_blocks * num_heads)
-    """
-    model.eval()
-    
-    ce_loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-    
-    n_samples = len(dataloader.dataset)
-    total_heads = num_blocks * num_heads
-    
-    # Per-sample gradient projections
-    per_sample_projections = np.zeros((n_samples, total_heads), dtype=np.float32)
-    
-    sample_idx = 0
-    
-    for batch in tqdm(dataloader, desc="Computing head gradients"):
-        images = batch["image"].to(device)
-        masks = batch["mask_256"].to(device)
-        bboxes = batch["bbox"].numpy()
-        B = images.shape[0]
-        
-        for b_idx in range(B):
-            if sample_idx >= n_samples:
-                break
-            
-            # Single-sample forward
-            img = images[b_idx:b_idx+1]
-            msk = masks[b_idx:b_idx+1]
-            box = bboxes[b_idx:b_idx+1]
-            
-            for block_idx in range(num_blocks):
-                attn_module = model.image_encoder.blocks[block_idx].attn
-                
-                # Freeze all, unfreeze this attention
-                for p in model.parameters():
-                    p.requires_grad = False
-                for p in attn_module.parameters():
-                    p.requires_grad = True
-                
-                model.zero_grad()
-                
-                # Forward
-                image_embedding = model.image_encoder(img)
-                
-                with torch.no_grad():
-                    box_t = torch.as_tensor(box, dtype=torch.float32, device=device)
-                    if len(box_t.shape) == 2:
-                        box_t = box_t[:, None, :]
-                    sparse_emb, dense_emb = model.prompt_encoder(
-                        points=None, boxes=box_t, masks=None
-                    )
-                
-                low_res_masks, _ = model.mask_decoder(
-                    image_embeddings=image_embedding,
-                    image_pe=model.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_emb,
-                    dense_prompt_embeddings=dense_emb,
-                    multimask_output=False,
-                )
-                
-                loss = F.binary_cross_entropy_with_logits(low_res_masks, msk.float()) + \
-                       (1 - 2 * (torch.sigmoid(low_res_masks) * msk.float()).sum() / 
-                        (torch.sigmoid(low_res_masks).sum() + msk.float().sum() + 1e-8))
-                
-                loss.backward()
-                
-                # Extract per-head projection
-                dim = attn_module.qkv.weight.shape[1]
-                head_dim = dim // num_heads
-                
-                with torch.no_grad():
-                    qkv_g = attn_module.qkv.weight.grad
-                    qkv_w = attn_module.qkv.weight.data
-                    proj_g = attn_module.proj.weight.grad
-                    proj_w = attn_module.proj.weight.data
-                    
                     for h in range(num_heads):
-                        head_id = block_idx * num_heads + h
-                        q_s = slice(h * head_dim, (h+1) * head_dim)
-                        k_s = slice(dim + h * head_dim, dim + (h+1) * head_dim)
-                        v_s = slice(2*dim + h * head_dim, 2*dim + (h+1) * head_dim)
-                        p_s = slice(h * head_dim, (h+1) * head_dim)
-                        
+                        head_id = blk_idx * num_heads + h
+                        q_s = slice(h * head_dim,            (h + 1) * head_dim)
+                        k_s = slice(dim + h * head_dim,      dim + (h + 1) * head_dim)
+                        v_s = slice(2 * dim + h * head_dim,  2 * dim + (h + 1) * head_dim)
+                        p_s = slice(h * head_dim,            (h + 1) * head_dim)
+
                         val = 0.0
                         for s in [q_s, k_s, v_s]:
                             val += (qkv_g[s, :] * qkv_w[s, :]).sum().item()
                         val += (proj_g[:, p_s] * proj_w[:, p_s]).sum().item()
-                        
-                        per_sample_projections[sample_idx, head_id] = val
-                
-                model.zero_grad()
-                for p in attn_module.parameters():
+
+                        # Bias terms (included for completeness)
+                        if attn.qkv.bias is not None and attn.qkv.bias.grad is not None:
+                            qb_g = attn.qkv.bias.grad
+                            qb_w = attn.qkv.bias.data
+                            for s in [q_s, k_s, v_s]:
+                                val += (qb_g[s] * qb_w[s]).sum().item()
+
+                        if attn.proj.bias is not None and attn.proj.bias.grad is not None:
+                            pb_g = attn.proj.bias.grad
+                            pb_w = attn.proj.bias.data
+                            # proj bias is shared; distribute equally across heads
+                            val += (pb_g * pb_w).sum().item() / num_heads
+
+                        # P1.1: frequency-weighted projection
+                        per_sample_projections[sample_idx, head_id] = val * sqrt_omega
+
+            # Clean up
+            model.zero_grad()
+            for blk_idx in range(num_blocks):
+                for p in model.image_encoder.blocks[blk_idx].attn.parameters():
                     p.requires_grad = False
-            
+
             sample_idx += 1
-    
+
     head_importance = np.abs(per_sample_projections).mean(axis=0)
     return head_importance, per_sample_projections
 
 
 # ==============================================================================
-# 2. Scoring Methods
+# Scoring Methods
 # ==============================================================================
 
 def score_heads_random(num_blocks=12, num_heads=12, seed=42):
@@ -313,90 +223,97 @@ def score_heads_random(num_blocks=12, num_heads=12, seed=42):
 def score_heads_magnitude(model, num_blocks=12, num_heads=12):
     """
     Magnitude-based scoring: L2 norm of each head's qkv + proj weights.
+    Higher norm → more important.
     """
     scores = np.zeros(num_blocks * num_heads)
-    
-    for block_idx in range(num_blocks):
-        attn = model.image_encoder.blocks[block_idx].attn
-        dim = attn.qkv.weight.shape[1]
+
+    for blk_idx in range(num_blocks):
+        attn     = model.image_encoder.blocks[blk_idx].attn
+        dim      = attn.qkv.weight.shape[1]
         head_dim = dim // num_heads
-        
+
         with torch.no_grad():
-            qkv_w = attn.qkv.weight.data
+            qkv_w  = attn.qkv.weight.data
             proj_w = attn.proj.weight.data
-            
+
             for h in range(num_heads):
-                head_id = block_idx * num_heads + h
-                
-                q_s = slice(h * head_dim, (h+1) * head_dim)
-                k_s = slice(dim + h * head_dim, dim + (h+1) * head_dim)
-                v_s = slice(2*dim + h * head_dim, 2*dim + (h+1) * head_dim)
-                p_s = slice(h * head_dim, (h+1) * head_dim)
-                
-                norm = 0.0
+                head_id = blk_idx * num_heads + h
+                q_s = slice(h * head_dim,           (h + 1) * head_dim)
+                k_s = slice(dim + h * head_dim,     dim + (h + 1) * head_dim)
+                v_s = slice(2 * dim + h * head_dim, 2 * dim + (h + 1) * head_dim)
+                p_s = slice(h * head_dim,           (h + 1) * head_dim)
+
+                norm_sq = 0.0
                 for s in [q_s, k_s, v_s]:
-                    norm += qkv_w[s, :].norm().item() ** 2
-                norm += proj_w[:, p_s].norm().item() ** 2
-                
-                scores[head_id] = np.sqrt(norm)
-    
+                    norm_sq += qkv_w[s, :].norm().item() ** 2
+                norm_sq += proj_w[:, p_s].norm().item() ** 2
+                scores[head_id] = np.sqrt(norm_sq)
+
     return scores
 
 
 def score_heads_pointwise(per_sample_projections):
     """
     Pointwise regression scoring.
-    
-    Score = mean of |g_i^T * theta_j| across calibration samples.
-    Higher means this head contributes more to the loss landscape.
+    Score = mean |g_i^T · θ_j| across calibration samples.
+    (If freq_weights were applied in gradient computation, projections are
+    already frequency-weighted; no additional weighting needed here.)
     """
     return np.abs(per_sample_projections).mean(axis=0)
 
 
-def _sinkhorn_distance(x, y, epsilon=0.05, n_iter=100):
-    """
-    Compute the entropy-regularized Wasserstein distance W_{2,epsilon}
-    between two 1D empirical distributions using the Sinkhorn algorithm
-    in log-domain for numerical stability.
-    
-    Args:
-        x: np.ndarray of shape (n,) - samples from distribution mu
-        y: np.ndarray of shape (n,) - samples from distribution nu
-        epsilon: entropic regularization parameter
-        n_iter: number of Sinkhorn iterations
-    
-    Returns:
-        float: approximate W_{2,epsilon}^2
-    """
-    n = len(x)
-    m = len(y)
-    
-    # Cost matrix: squared Euclidean distance (1D)
-    C = (x[:, None] - y[None, :]) ** 2  # (n, m)
-    
-    # Log-domain Sinkhorn
-    log_K = -C / epsilon  # (n, m)
-    
-    # Uniform marginals
-    log_a = -np.log(n) * np.ones(n)
-    log_b = -np.log(m) * np.ones(m)
-    
-    log_u = np.zeros(n)
-    log_v = np.zeros(m)
-    
-    for _ in range(n_iter):
-        # Update u
-        log_u = log_a - _logsumexp(log_K + log_v[None, :], axis=1)
-        # Update v
-        log_v = log_b - _logsumexp(log_K + log_u[:, None], axis=0)
-    
-    # Transport plan in log domain
-    log_pi = log_u[:, None] + log_K + log_v[None, :]
-    pi = np.exp(log_pi)
-    
-    # W_{2,epsilon}^2 = <C, pi>
-    return (C * pi).sum()
+# ==============================================================================
+# P1.2 — L2 norm helper for EWR regularisation
+# ==============================================================================
 
+def compute_head_l2_norms(model, num_blocks=12, num_heads=12):
+    """
+    Compute L2 norm of teacher parameters for each attention head.
+
+    Used for the EWR regularisation term:
+        λ1 · ‖θ_z − θ̄‖²  ≈  λ1 · Σ_{j pruned} ‖θ̄_j‖²
+
+    Because removing head j zeros out its parameters (θ_j → 0),
+    the contribution of head j to the L2 penalty is ‖θ̄_j‖².
+
+    Returns:
+        norms: np.ndarray (total_heads,) — ‖θ̄_j‖ for each head j
+    """
+    norms = np.zeros(num_blocks * num_heads, dtype=np.float64)
+
+    for blk_idx in range(num_blocks):
+        attn     = model.image_encoder.blocks[blk_idx].attn
+        dim      = attn.qkv.weight.shape[1]
+        head_dim = dim // num_heads
+
+        with torch.no_grad():
+            qkv_w  = attn.qkv.weight.data
+            proj_w = attn.proj.weight.data
+
+            for h in range(num_heads):
+                head_id = blk_idx * num_heads + h
+                q_s = slice(h * head_dim,           (h + 1) * head_dim)
+                k_s = slice(dim + h * head_dim,     dim + (h + 1) * head_dim)
+                v_s = slice(2 * dim + h * head_dim, 2 * dim + (h + 1) * head_dim)
+                p_s = slice(h * head_dim,           (h + 1) * head_dim)
+
+                norm_sq = 0.0
+                for s in [q_s, k_s, v_s]:
+                    norm_sq += qkv_w[s, :].norm().item() ** 2
+                norm_sq += proj_w[:, p_s].norm().item() ** 2
+
+                if attn.qkv.bias is not None:
+                    for s in [q_s, k_s, v_s]:
+                        norm_sq += attn.qkv.bias.data[s].norm().item() ** 2
+
+                norms[head_id] = np.sqrt(norm_sq)
+
+    return norms.astype(np.float32)
+
+
+# ==============================================================================
+# Sinkhorn (log-domain)
+# ==============================================================================
 
 def _logsumexp(a, axis=None):
     """Numerically stable log-sum-exp."""
@@ -405,182 +322,248 @@ def _logsumexp(a, axis=None):
     return result.squeeze(axis=axis)
 
 
-def score_heads_ewr(per_sample_projections, epsilon=0.05):
+def _sinkhorn_distance(x, y, epsilon=0.05, n_iter=200):
     """
-    EWR (Entropy-regularized Wasserstein Regression) scoring.
-    
-    For each head j, compute W_{2,epsilon}^2 between the projection 
-    distribution with head j removed vs. the teacher projection distribution.
-    
-    Head importance = how much removing it increases the Wasserstein distance.
-    
+    Entropy-regularised 2-Wasserstein distance W_{2,ε}² between two
+    1D empirical distributions, computed in log-domain for stability.
+
+    n_iter increased to 200 (from 100) to improve convergence for small ε.
+
     Args:
-        per_sample_projections: (n_samples, total_heads) array
-        epsilon: Sinkhorn regularization parameter
-    
+        x: (n,) samples from μ (pruned projections)
+        y: (m,) samples from ν (teacher projections)
+        epsilon: entropic regularisation (smaller → closer to true W₂)
+        n_iter: Sinkhorn iterations
+
     Returns:
-        scores: (total_heads,) importance scores. Higher = more important.
+        float: approximate W_{2,ε}²
+    """
+    n = len(x)
+    m = len(y)
+
+    C      = (x[:, None] - y[None, :]) ** 2   # (n, m) cost matrix
+    log_K  = -C / epsilon
+
+    log_a  = np.full(n, -np.log(n))
+    log_b  = np.full(m, -np.log(m))
+
+    log_u  = np.zeros(n)
+    log_v  = np.zeros(m)
+
+    for _ in range(n_iter):
+        log_u = log_a - _logsumexp(log_K + log_v[None, :], axis=1)
+        log_v = log_b - _logsumexp(log_K + log_u[:, None], axis=0)
+
+    log_pi = log_u[:, None] + log_K + log_v[None, :]
+    pi     = np.exp(log_pi)
+
+    return float((C * pi).sum())
+
+
+# ==============================================================================
+# P1.2 — EWR scoring with L2 regularisation
+# ==============================================================================
+
+def score_heads_ewr(
+    per_sample_projections,
+    epsilon=0.05,
+    model=None,
+    lambda1=0.01,
+    num_blocks=12,
+    num_heads=12,
+):
+    """
+    EWR (Entropy-regularised Wasserstein Regression) head importance scoring.
+
+    For each head j, score = increase in W_{2,ε}² when head j is removed,
+    plus an L2 regularisation term:
+
+        score_j = W_{2,ε}²(μ_{without j}, ν_teacher)  +  λ1 · ‖θ̄_j‖²
+
+    P1.2 change: The L2 term λ1·‖θ̄_j‖² is added when model is provided.
+    It penalises removing large-norm heads, matching the EWR objective in spec §3.
+
+    If freq_weights were applied during gradient computation (P1.1), the
+    projections in per_sample_projections are already ω-weighted, so the
+    distributions μ and ν are the correct frequency-weighted ones (spec §3).
+
+    Args:
+        per_sample_projections : (n_samples, total_heads) — already ω-weighted
+        epsilon                : Sinkhorn regularisation
+        model                  : Sam model (needed for L2 norm computation).
+                                 Pass None to disable L2 term.
+        lambda1                : L2 regularisation coefficient (default 0.01)
+        num_blocks, num_heads  : architecture parameters
+
+    Returns:
+        scores: (total_heads,) — higher means head is more important (keep it)
     """
     n_samples, total_heads = per_sample_projections.shape
-    scores = np.zeros(total_heads)
-    
-    # Teacher projection: sum over all heads for each sample
-    teacher_total = per_sample_projections.sum(axis=1)  # (n_samples,)
-    
-    for j in tqdm(range(total_heads), desc=f"EWR scoring (eps={epsilon})"):
-        # Projection with head j removed
-        pruned_total = teacher_total - per_sample_projections[:, j]  # (n_samples,)
-        
-        # W_{2,epsilon}^2 between pruned and teacher distributions
+    scores = np.zeros(total_heads, dtype=np.float32)
+
+    # Teacher projection: sum over all heads (approximation of global projection)
+    # Because all projections come from the same computation graph (P0.2/P0.3),
+    # this sum is a consistent approximation of g_i^T · θ_attn.
+    teacher_total = per_sample_projections.sum(axis=1)   # (n_samples,)
+
+    # P1.2: Pre-compute L2 norms of teacher head parameters
+    if model is not None and lambda1 > 0.0:
+        head_norms   = compute_head_l2_norms(model, num_blocks, num_heads)
+        head_l2_sq   = (head_norms ** 2).astype(np.float32)
+    else:
+        head_l2_sq   = np.zeros(total_heads, dtype=np.float32)
+
+    for j in tqdm(range(total_heads), desc=f"EWR scoring (ε={epsilon}, λ1={lambda1})"):
+        # Distribution when head j is removed
+        pruned_total = teacher_total - per_sample_projections[:, j]
+
+        # Wasserstein distance between pruned and teacher distributions
         w_dist = _sinkhorn_distance(pruned_total, teacher_total, epsilon=epsilon)
-        scores[j] = w_dist
-    
+
+        # P1.2: Add L2 regularisation term
+        scores[j] = w_dist + lambda1 * head_l2_sq[j]
+
     return scores
 
 
 # ==============================================================================
-# 3. Head Mask Generation and Application
+# P0.1 — Head Mask Generation and Application (hook BEFORE proj)
 # ==============================================================================
 
 def generate_head_mask(scores, sparsity, num_blocks=12, num_heads=12):
     """
-    Generate a binary head mask based on importance scores and target sparsity.
-    
+    Generate a binary head mask: remove the (sparsity * total_heads) least
+    important heads (lowest scores).
+
     Args:
-        scores: (total_heads,) importance scores. Higher = more important.
-        sparsity: fraction of heads to remove (e.g., 0.3 = remove 30%)
-        num_blocks: number of ViT blocks
-        num_heads: number of heads per block
-    
+        scores   : (total_heads,) importance scores — higher means more important
+        sparsity : fraction of heads to remove (e.g. 0.3)
+
     Returns:
         head_mask: (total_heads,) binary mask, 1 = keep, 0 = remove
     """
     total_heads = num_blocks * num_heads
-    n_remove = int(total_heads * sparsity)
-    
-    # Sort by importance (ascending) and remove the least important
-    sorted_indices = np.argsort(scores)
-    
+    n_remove    = int(total_heads * sparsity)
+
+    sorted_indices = np.argsort(scores)   # ascending: least important first
     mask = np.ones(total_heads, dtype=np.float32)
     mask[sorted_indices[:n_remove]] = 0.0
-    
     return mask
 
 
 def apply_head_mask_to_model(model, head_mask, num_blocks=12, num_heads=12):
     """
-    Apply head mask by injecting a forward hook into each Attention module.
-    
-    The hook zeros out the output of pruned heads before the projection layer.
-    This does NOT modify the original weights, ensuring reversibility.
-    
+    Apply head mask via a forward_pre_hook on each block's attn.proj layer.
+
+    P0.1 fix: The hook now fires BEFORE the projection layer, intercepting
+    the concatenated head outputs (shape: ..., dim) and zeroing the slice
+    corresponding to each pruned head. This is the semantically correct point
+    to remove a head's contribution, because proj (W_proj) mixes all heads —
+    masking after proj does not correspond to head removal.
+
+    The hook targets attn.proj's input, which has shape (..., dim) where
+    dim = num_heads * head_dim and head h occupies columns
+    [h*head_dim : (h+1)*head_dim].
+
     Args:
-        model: Sam model
-        head_mask: (total_heads,) np array, 1=keep, 0=remove
-        num_blocks, num_heads: architecture parameters
-    
+        model     : Sam model
+        head_mask : (total_heads,) np array, 1=keep, 0=remove
+
     Returns:
         hooks: list of hook handles (call .remove() to undo)
     """
     hooks = []
-    
-    for block_idx in range(num_blocks):
-        block = model.image_encoder.blocks[block_idx]
-        attn_module = block.attn
-        
-        # Create mask for this block's heads
-        block_mask = head_mask[block_idx * num_heads: (block_idx + 1) * num_heads]
-        block_mask_tensor = torch.tensor(block_mask, dtype=torch.float32)
-        
-        def make_hook(mask_tensor, n_heads):
-            """Create a closure capturing the mask."""
-            def hook_fn(module, input, output):
-                # output shape: (B, H, W, dim)
-                B, H, W, dim = output.shape
-                head_dim = dim // n_heads
-                
-                # Reshape to (B, H, W, n_heads, head_dim)
-                out = output.view(B, H, W, n_heads, head_dim)
-                
-                # Apply mask: (n_heads,) -> (1, 1, 1, n_heads, 1)
-                device = output.device
-                m = mask_tensor.to(device).view(1, 1, 1, n_heads, 1)
-                out = out * m
-                
-                return out.view(B, H, W, dim)
+
+    for blk_idx in range(num_blocks):
+        attn_module = model.image_encoder.blocks[blk_idx].attn
+        block_mask  = head_mask[blk_idx * num_heads: (blk_idx + 1) * num_heads]
+
+        # Pre-compute the channel-level mask once per block (shape: dim,)
+        # so the hook itself has no Python loop over heads.
+        head_dim     = attn_module.qkv.weight.shape[1] // num_heads
+        channel_mask = np.repeat(block_mask, head_dim).astype(np.float32)
+
+        def make_pre_hook(ch_mask):
+            """Closure capturing the channel mask for one block."""
+            def hook_fn(module, input):
+                # input is a tuple; input[0]: (..., dim)  (before W_proj)
+                x = input[0]
+                m = torch.tensor(ch_mask, dtype=x.dtype, device=x.device)
+                # Broadcast: (..., dim) * (dim,)  →  zero pruned head channels
+                return (x * m,)
             return hook_fn
-        
-        # Note: We hook the attention output BEFORE the proj layer
-        # But the forward() applies proj after attn computation.
-        # So we need to hook differently - we'll modify the forward to apply mask
-        # Actually, let's use a different approach: modify the proj layer's input
-        
-        # Better approach: register a hook on the Attention module itself
-        # The output of attn.forward() is already (B, H, W, dim) after proj
-        # We need to mask BEFORE proj, so we'll use a pre-forward hook on proj
-        # or simply hook the full Attention output and compensate
-        
-        # Simplest correct approach: hook the Attention module output
-        # Since proj mixes heads, we mask the Attention output which already 
-        # went through proj. This is approximately correct for pruning evaluation.
-        hook = attn_module.register_forward_hook(
-            make_hook(block_mask_tensor, num_heads)
+
+        # register_forward_pre_hook fires before module.forward(), i.e. before proj
+        hook = attn_module.proj.register_forward_pre_hook(
+            make_pre_hook(channel_mask)
         )
         hooks.append(hook)
-    
+
     return hooks
 
 
 def remove_hooks(hooks):
-    """Remove all hooks to restore original model behavior."""
+    """Remove all registered hooks to restore original model behaviour."""
     for h in hooks:
         h.remove()
 
 
 # ==============================================================================
-# 4. Convenience: Get All Scores
+# Convenience: compute all scores
 # ==============================================================================
 
-def compute_all_head_scores(model, cal_loader, device, epsilon_values=[0.01, 0.05, 0.1]):
+def compute_all_head_scores(
+    model, cal_loader, device,
+    freq_weights=None,
+    epsilon_values=None,
+    lambda1=0.01,
+):
     """
     Compute head importance scores for all methods.
-    
+
     Args:
-        model: MedSAM model on device
-        cal_loader: calibration data loader
-        device: torch device
-        epsilon_values: list of epsilon values for EWR
-    
+        model          : MedSAM model on device
+        cal_loader     : calibration DataLoader
+        device         : torch device
+        freq_weights   : np.ndarray (n_samples,) — ω_freq per sample (P1.1).
+                         Pass None to skip frequency weighting.
+        epsilon_values : list of ε for EWR (default [0.01, 0.05, 0.1])
+        lambda1        : L2 regularisation coefficient for EWR (P1.2)
+
     Returns:
-        dict of method_name -> scores array (total_heads,)
+        dict  method_name → scores array (total_heads,)
     """
+    if epsilon_values is None:
+        epsilon_values = [0.01, 0.05, 0.1]
+
     print("=" * 60)
-    print("Computing head importance scores for all methods")
+    print("Computing head importance scores")
     print("=" * 60)
-    
+
     results = {}
-    
-    # 1. Random
-    print("\n[1/4] Random scoring...")
+
+    print("\n[1/4] Random scoring ...")
     results["random"] = score_heads_random()
-    
-    # 2. Magnitude
-    print("[2/4] Magnitude scoring...")
+
+    print("[2/4] Magnitude scoring ...")
     results["magnitude"] = score_heads_magnitude(model)
-    
-    # 3 & 4. Need gradient projections
-    print("[3/4] Computing gradient projections (this takes a while)...")
+
+    print("[3/4] Computing gradient projections (single-pass per sample) ...")
     head_importance, per_sample_proj = compute_head_gradient_projections_fast(
-        model, cal_loader, device
+        model, cal_loader, device, freq_weights=freq_weights
     )
-    
-    # 3. Pointwise
+
+    print("[3/4] Pointwise scoring ...")
     results["pointwise"] = score_heads_pointwise(per_sample_proj)
-    
-    # 4. EWR with different epsilon
-    print("[4/4] EWR scoring...")
+
+    print("[4/4] EWR scoring ...")
     for eps in epsilon_values:
         key = f"ewr_eps{eps}"
-        results[key] = score_heads_ewr(per_sample_proj, epsilon=eps)
-    
+        results[key] = score_heads_ewr(
+            per_sample_proj,
+            epsilon=eps,
+            model=model,
+            lambda1=lambda1,
+        )
+
     return results

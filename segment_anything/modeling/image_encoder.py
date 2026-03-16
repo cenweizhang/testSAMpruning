@@ -226,6 +226,17 @@ class Attention(nn.Module):
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
 
+        # Head mask for structured pruning (set via set_head_mask)
+        self.head_mask: Optional[torch.Tensor] = None
+
+    def set_head_mask(self, mask: Optional[torch.Tensor]) -> None:
+        """
+        Set head-level pruning mask. mask shape: (num_heads,), values 0 or 1.
+        Heads with mask=0 will have their output zeroed BEFORE the proj layer.
+        Pass None to disable masking.
+        """
+        self.head_mask = mask
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
@@ -243,12 +254,15 @@ class Attention(nn.Module):
             )
 
         attn = attn.softmax(dim=-1)
-        x = (
-            (attn @ v)
-            .view(B, self.num_heads, H, W, -1)
-            .permute(0, 2, 3, 1, 4)
-            .reshape(B, H, W, -1)
-        )
+        x = (attn @ v).view(B, self.num_heads, H, W, -1)  # (B, nHead, H, W, head_dim)
+
+        # === Head mask: zero out pruned heads BEFORE proj ===
+        if self.head_mask is not None:
+            # head_mask shape: (num_heads,) -> (1, num_heads, 1, 1, 1)
+            mask = self.head_mask.view(1, self.num_heads, 1, 1, 1)
+            x = x * mask
+
+        x = x.permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)  # (B, H, W, dim)
         x = self.proj(x)
 
         return x
