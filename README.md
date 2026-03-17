@@ -9,30 +9,50 @@
 
 
 ## 3. 测试运行
+### Check 1
+python -m pilot_phase1.check1_proxy \
+    --data_root assert/CVC-ColonDB \
+    --checkpoint work_dir/MedSAM/medsam_vit_b.pth \
+    --device cuda:0 \
+    --n_calibration 128 \
+    --check_blocks 0 6 11 \
+    --output_dir results/phase1_v2
+
+### Check 3(fast)
 python -m pilot_phase1.run_phase1 \
     --data_root assert/CVC-ColonDB \
     --checkpoint work_dir/MedSAM/medsam_vit_b.pth \
     --device cuda:0 \
     --n_calibration 128 \
-    --output_dir results/phase1 \
-    --lambda1 0.01
+    --sparsities 0.5 \
+    --alpha_values 0.1 0.5 1.0 \
+    --check_eps_sensitivity \
+    --sinkhorn_iters 100 \
+    --output_dir results/phase1_v2
+
+### Check 2
+python -m pilot_phase1.run_phase1 \
+    --data_root assert/CVC-ColonDB \
+    --checkpoint work_dir/MedSAM/medsam_vit_b.pth \
+    --device cuda:0 \
+    --n_calibration 128 \
+    --sparsities 0.5 \
+    --alpha_values 0.1 0.5 1.0 \
+    --sinkhorn_iters 100 \
+    --output_dir results/phase1_v2
+
+### Final complete
+python -m pilot_phase1.run_phase1 \
+    --data_root assert/CVC-ColonDB \
+    --checkpoint work_dir/MedSAM/medsam_vit_b.pth \
+    --device cuda:0 \
+    --n_calibration 128 \
+    --sparsities 0.3 0.5 0.7 \
+    --alpha_values 0.1 0.5 1.0 \
+    --sinkhorn_iters 100 \
+    --include_legacy \
+    --output_dir results/phase1_v2
+
 
 ## problems
-[Step 4] Computing head importance scores...
-Traceback (most recent call last):
-  File "/home/vipuser/.conda/envs/medsam/lib/python3.10/runpy.py", line 196, in _run_module_as_main
-    return _run_code(code, main_globals, None,
-  File "/home/vipuser/.conda/envs/medsam/lib/python3.10/runpy.py", line 86, in _run_code
-    exec(code, run_globals)
-  File "/home/vipuser/testMedSAM/pilot_phase1/run_phase1.py", line 328, in <module>
-    main()
-  File "/home/vipuser/testMedSAM/pilot_phase1/run_phase1.py", line 131, in main
-    head_importance, per_sample_proj = compute_head_gradient_projections_fast(
-  File "/home/vipuser/testMedSAM/pilot_phase1/head_pruning.py", line 208, in compute_head_gradient_projections_fast
-    seg_loss_fn = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="none")
-NameError: name 'monai' is not defined
---data_root：未找到命令
---checkpoint：未找到命令
---device：未找到命令
---n_calibration：未找到命令
---output_dir：未找到命令
+none
