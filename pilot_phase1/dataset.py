@@ -212,7 +212,7 @@ class PolypDataset(Dataset):
 # Data loader builder
 # ==============================================================================
 
-def build_dataloaders(data_root, n_calibration=128, batch_size=4, seed=42):
+def build_dataloaders(data_root, n_calibration=128, batch_size=4, seed=42, num_workers=4):
     """
     Split dataset into calibration and test sets.
 
@@ -244,11 +244,11 @@ def build_dataloaders(data_root, n_calibration=128, batch_size=4, seed=42):
 
     cal_loader = DataLoader(
         cal_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=0, pin_memory=True,
+        num_workers=num_workers, pin_memory=True,
     )
     test_loader = DataLoader(
         test_dataset, batch_size=1, shuffle=False,
-        num_workers=0, pin_memory=True,
+        num_workers=num_workers, pin_memory=True,
     )
 
     # P1: Pre-extract frequency weights for all calibration samples

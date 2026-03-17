@@ -87,9 +87,13 @@ def main():
     parser.add_argument("--checkpoint", type=str, default="work_dir/MedSAM/medsam_vit_b.pth")
     parser.add_argument("--device",     type=str, default="cuda:0")
     parser.add_argument("--n_calibration", type=int, default=128)
-    parser.add_argument("--batch_size",    type=int, default=4)
+    parser.add_argument("--batch_size",    type=int, default=32,
+                        help="Calibration batch size. Increase to saturate GPU "
+                             "(40 GB VRAM → 32-64 safe for ViT-B).")
     parser.add_argument("--output_dir",    type=str, default="results/phase1_v2")
     parser.add_argument("--seed",          type=int, default=42)
+    parser.add_argument("--num_workers",   type=int, default=4,
+                        help="DataLoader worker processes for parallel data loading.")
     parser.add_argument("--sparsities",    type=float, nargs="+", default=[0.3, 0.5, 0.7])
 
     # V2: relative epsilon α values (replaces absolute --epsilons)
@@ -153,6 +157,7 @@ def main():
         n_calibration=args.n_calibration,
         batch_size=args.batch_size,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
 
     cv = cal_freq_weights.std() / max(cal_freq_weights.mean(), 1e-8)
@@ -193,6 +198,7 @@ def main():
             per_sample_proj, diag_sparsity,
             alpha_values=tuple(args.alpha_values),
             n_iter=args.sinkhorn_iters,
+            device=args.device,
         )
 
         print(f"\n  Block-mask overlap matrix (sparsity={diag_sparsity}):")
@@ -272,7 +278,7 @@ def main():
         # ---- Pointwise blockwise (exhaustive) ----
         t0 = time.time()
         pw_bw_mask   = generate_head_mask_blockwise(
-            per_sample_proj, sparsity, method='pointwise'
+            per_sample_proj, sparsity, method='pointwise', device=args.device
         )
         pw_bw_result = evaluate_pruned_model(
             model, test_loader, pw_bw_mask, device
@@ -290,7 +296,7 @@ def main():
             t0 = time.time()
             ewr_mask   = generate_head_mask_blockwise(
                 per_sample_proj, sparsity, method='ewr',
-                alpha=alpha, n_iter=args.sinkhorn_iters,
+                alpha=alpha, n_iter=args.sinkhorn_iters, device=args.device,
             )
             ewr_result = evaluate_pruned_model(
                 model, test_loader, ewr_mask, device
@@ -323,12 +329,14 @@ def main():
                 cal_l, _, _, _, fw = build_dataloaders(
                     args.data_root, n_calibration=args.n_calibration,
                     batch_size=args.batch_size, seed=seed,
+                    num_workers=args.num_workers,
                 )
                 _, proj_s = compute_head_gradient_projections_fast(
                     model, cal_l, device, freq_weights=fw
                 )
                 mask_s = generate_head_mask_blockwise(
-                    proj_s, ms_sparsity, verbose=False, **method_kw
+                    proj_s, ms_sparsity, verbose=False,
+                    device=args.device, **method_kw
                 )
                 seed_metrics.append(
                     evaluate_pruned_model(model, test_loader, mask_s, device)["avg_metrics"]
