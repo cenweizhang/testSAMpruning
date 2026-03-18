@@ -41,7 +41,7 @@ python -m pilot_phase1.run_phase1 \
 python -m pilot_phase1.run_phase1 \
     --data_root assert/CVC-ColonDB \
     --checkpoint work_dir/MedSAM/medsam_vit_b.pth \
-    --device cuda:0 \
+    --device cuda:1 \
     --n_calibration 128 \
     --sparsities 0.5 \
     --alpha_values 0.1 0.5 1.0 \
@@ -52,7 +52,7 @@ python -m pilot_phase1.run_phase1 \
 python -m pilot_phase1.run_phase1 \
     --data_root assert/CVC-ColonDB \
     --checkpoint work_dir/MedSAM/medsam_vit_b.pth \
-    --device cuda:0 \
+    --device cuda:2 \
     --n_calibration 128 \
     --sparsities 0.3 0.5 0.7 \
     --alpha_values 0.1 0.5 1.0 \
